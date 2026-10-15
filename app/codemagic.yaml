@@ -1,0 +1,180 @@
+workflows:
+  ios-unsigned:
+    name: iOS Unsigned IPA
+    max_build_duration: 60
+    environment:
+      node: 20
+      xcode: latest        # Xcode 26.4 — required for Expo SDK 56 / RN 0.85
+      cocoapods: default
+      groups:
+        # Group "runloop_secrets" in the Codemagic UI holds:
+        #   MAPBOX_DOWNLOAD_TOKEN     — sk.ey... (DOWNLOADS:READ scope)
+        #   EXPO_PUBLIC_MAPBOX_TOKEN  — pk.ey...
+        #   EXPO_PUBLIC_ROUTE_API_KEY — gates the public Funnel endpoint.
+        #     Never inline it here: this file is tracked and pushed.
+        - runloop_secrets
+      vars:
+        EXPO_PUBLIC_ROUTE_API_BASE: "https://your-route-service.example.com"
+        # Forces precompiled XCFrameworks — prevents ExpoModulesJSI xcframework
+        # build script from running (which fails with CODE_SIGNING_ALLOWED=NO).
+        EXPO_USE_PRECOMPILED_MODULES: "1"
+    scripts:
+      - name: Install JS deps
+        script: npm ci
+
+      - name: Remove expo-dev-client (not needed in release archive)
+        script: npm uninstall expo-dev-client
+
+      - name: Expo prebuild (iOS)
+        # --clean regenerates the ios/ folder; MAPBOX_DOWNLOAD_TOKEN is consumed here
+        # by the @rnmapbox/maps plugin to write ~/.netrc for CocoaPods auth
+        script: npx expo prebuild -p ios --clean
+
+      - name: Install CocoaPods
+        script: cd ios && pod install
+
+      - name: Archive (unsigned)
+        script: |
+          xcodebuild archive \
+            -workspace ios/RunLoop.xcworkspace \
+            -scheme RunLoop \
+            -configuration Release \
+            -archivePath "$CM_BUILD_DIR/RunLoop.xcarchive" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CURRENT_PROJECT_VERSION=$BUILD_NUMBER
+
+      - name: Package unsigned IPA
+        script: |
+          mkdir -p Payload
+          cp -r "$CM_BUILD_DIR/RunLoop.xcarchive/Products/Applications/RunLoop.app" Payload/
+          zip -qr RunLoop.ipa Payload
+
+    artifacts:
+      - RunLoop.ipa
+
+  ios-dev-client:
+    name: iOS Dev Client (Debug)
+    # Build ONCE, install ONCE via SideStore. After that, JS/UI changes hot-reload
+    # over WiFi from `npx expo start --dev-client` on your laptop — no rebuild.
+    # Only re-run this workflow when you ADD/REMOVE a native module.
+    max_build_duration: 60
+    environment:
+      node: 20
+      xcode: latest        # Xcode 26.4 — required for Expo SDK 56 / RN 0.85
+      cocoapods: default
+      groups:
+        - runloop_secrets
+      vars:
+        EXPO_PUBLIC_ROUTE_API_BASE: "https://your-route-service.example.com"
+        EXPO_USE_PRECOMPILED_MODULES: "1"
+    scripts:
+      - name: Install JS deps
+        script: npm ci
+
+      # NOTE: unlike the release workflow, we KEEP expo-dev-client — it is the
+      # library that lets the installed app connect to a Metro dev server.
+
+      - name: Expo prebuild (iOS)
+        script: npx expo prebuild -p ios --clean
+
+      - name: Install CocoaPods
+        script: cd ios && pod install
+
+      - name: Archive (unsigned, Debug)
+        # Debug config does NOT embed a JS bundle — the app loads JS from Metro
+        # at runtime, which is what enables hot reload. Without Metro reachable it
+        # shows the dev-client launcher to enter/scan the dev server URL.
+        script: |
+          xcodebuild archive \
+            -workspace ios/RunLoop.xcworkspace \
+            -scheme RunLoop \
+            -configuration Debug \
+            -archivePath "$CM_BUILD_DIR/RunLoop.xcarchive" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CURRENT_PROJECT_VERSION=$BUILD_NUMBER
+
+      - name: Package unsigned IPA
+        script: |
+          mkdir -p Payload
+          cp -r "$CM_BUILD_DIR/RunLoop.xcarchive/Products/Applications/RunLoop.app" Payload/
+          zip -qr RunLoop-dev.ipa Payload
+
+    artifacts:
+      - RunLoop-dev.ipa
+
+  ios-testflight:
+    name: iOS TestFlight (signed release)
+    max_build_duration: 60
+    integrations:
+      app_store_connect: RunLoop ASC Key   # must match the key name in Codemagic UI exactly
+    environment:
+      node: 20
+      xcode: latest        # Xcode 26.4 — required for Expo SDK 56 / RN 0.85
+      cocoapods: default
+      groups:
+        - runloop_secrets
+      vars:
+        BUNDLE_ID: "com.brian.runloop"
+        EXPO_PUBLIC_ROUTE_API_BASE: "https://your-route-service.example.com"
+        EXPO_USE_PRECOMPILED_MODULES: "1"
+    scripts:
+      - name: Install JS deps
+        script: npm ci
+
+      - name: Remove expo-dev-client (not needed in release archive)
+        script: npm uninstall expo-dev-client
+
+      - name: Expo prebuild (iOS)
+        script: npx expo prebuild -p ios --clean
+
+      - name: Install CocoaPods
+        script: cd ios && pod install
+
+      - name: Set build number
+        # TestFlight rejects duplicate build numbers; prebuild resets CFBundleVersion to 1.
+        script: cd ios && agvtool new-version -all $BUILD_NUMBER
+
+      - name: Set up code signing (create cert + profile if missing)
+        # Automatic signing via the App Store Connect API key integration.
+        # --create makes the distribution cert + profile on first run if absent.
+        script: |
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --create
+          # The Live Activity widget is a SEPARATE target with its own bundle ID and so
+          # needs its own profile. Without this, use-profiles finds none for the extension
+          # and the archive fails. Name comes from the plugin: sanitizedName(app) + "Widgets".
+          app-store-connect fetch-signing-files "$BUNDLE_ID.RunLoopWidgets" --type IOS_APP_STORE --create
+          keychain add-certificates
+          # Scope to the app project only; default globs every *.xcodeproj under the
+          # repo and fails on node_modules/@rnmapbox/maps/ios/RNMBX.xcodeproj.
+          xcode-project use-profiles --project "ios/RunLoop.xcodeproj"
+
+      - name: Build signed IPA
+        script: |
+          xcode-project build-ipa \
+            --workspace ios/RunLoop.xcworkspace \
+            --scheme RunLoop
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        # TEMPORARILY false while the Live Activity native side is unverified.
+        # true submits the build for EXTERNAL Beta App Review; the upload to App Store
+        # Connect happens either way, and the Internal group auto-distributes, so a
+        # false build is still installable immediately via TestFlight.
+        # Set back to true once a device run confirms the widget extension works —
+        # otherwise an unreviewed build joins the queue beside one already in review.
+        submit_to_testflight: false

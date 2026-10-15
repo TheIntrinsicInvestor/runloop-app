@@ -1,0 +1,14 @@
+[Unit]
+Description=Running App route service
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/route-service
+EnvironmentFile=/home/ubuntu/route-service/.env
+ExecStart=/home/ubuntu/route-service-env/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
